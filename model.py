@@ -429,8 +429,96 @@ __device__ void accumulate_pv(const float* p_tile, const float* v_tile,
     }
 }
 
-# Step 23 - flash_attention_kernel (not yet solved)
-# TODO: implement
+# Step 23 - flash_attention_kernel
+__global__ void flash_attention_kernel(const float* q, const float* k, const float* v,
+                                       float* out, int seq_len, int head_dim,
+                                       int tile_q, int tile_k, float scale) {
+  
+    extern __shared__ char smem[];
+    
+    int q_tile_size = tile_q * head_dim * sizeof(float);
+    int k_tile_size = tile_k * head_dim * sizeof(float);
+    int v_tile_size = tile_k * head_dim * sizeof(float);
+    int s_tile_size = tile_q * tile_k * sizeof(float);
+    int stats_size  = tile_q * sizeof(float); 
+
+    float* q_shared = (float*)smem;
+    float* k_shared = (float*)(smem + q_tile_size);
+    float* v_shared = (float*)(smem + q_tile_size + k_tile_size);
+    float* s_tile   = (float*)(smem + q_tile_size + k_tile_size + v_tile_size);
+    float* o_shared = (float*)(smem + q_tile_size + k_tile_size + v_tile_size + s_tile_size);
+    float* m_shared = (float*)(smem + q_tile_size + k_tile_size + v_tile_size + s_tile_size + tile_q * head_dim * sizeof(float));
+    float* l_shared = m_shared + tile_q;
+    float* row_max  = l_shared + tile_q;
+    float* row_sum  = row_max + tile_q;
+
+    int thread_id = threadIdx.x;
+    int num_threads = blockDim.x;
+    
+    int q_block_start = blockIdx.x * tile_q;
+
+  
+    load_tile(q, q_shared, q_block_start, 0, seq_len, head_dim, tile_q, head_dim, thread_id, num_threads);
+
+    for (int r = thread_id; r < tile_q; r += num_threads) {
+        m_shared[r] = -1e38f;
+        l_shared[r] = 0.0f;
+    }
+    for (int i = thread_id; i < tile_q * head_dim; i += num_threads) {
+        o_shared[i] = 0.0f;
+    }
+    __syncthreads();
+    for (int kv_start = 0; kv_start < seq_len; kv_start += tile_k) {
+
+        load_tile(k, k_shared, kv_start, 0, seq_len, head_dim, tile_k, head_dim, thread_id, num_threads);
+        load_tile(v, v_shared, kv_start, 0, seq_len, head_dim, tile_k, head_dim, thread_id, num_threads);
+        __syncthreads();
+
+        tile_scores(q_shared, k_shared, s_tile, tile_q, tile_k, head_dim, scale, thread_id, num_threads);
+        __syncthreads();
+
+        tile_rowmax(s_tile, row_max, tile_q, tile_k, thread_id, num_threads);
+        __syncthreads();
+
+      
+        for (int r = thread_id; r < tile_q; r += num_threads) {
+            float tile_max = row_max[r];
+            float old_max = m_shared[r];
+            
+            float new_max = online_max(old_max, tile_max);
+            float corr = correction_factor(old_max, new_max);
+
+            m_shared[r] = new_max;
+            rescale_output(&o_shared[r * head_dim], head_dim, corr);
+   
+            row_max[r] = corr; 
+        }
+        __syncthreads();
+
+        tile_exp(s_tile, m_shared, tile_q, tile_k, thread_id, num_threads);
+        tile_rowsum(s_tile, row_sum, tile_q, tile_k, thread_id, num_threads);
+        __syncthreads();
+
+        for (int r = thread_id; r < tile_q; r += num_threads) {
+            l_shared[r] = update_running_sum(l_shared[r], row_max[r], row_sum[r]);
+        }
+
+        accumulate_pv(s_tile, v_shared, o_shared, tile_q, tile_k, head_dim, thread_id, num_threads);
+        __syncthreads(); 
+    }
+
+    for (int i = thread_id; i < tile_q * head_dim; i += num_threads) {
+        int r = i / head_dim;
+        int d = i % head_dim;
+        int global_r = q_block_start + r;
+        
+        if (global_r < seq_len && l_shared[r] > 1e-10f) {
+            out[global_r * head_dim + d] = o_shared[i] / l_shared[r];
+        } else if (global_r < seq_len) {
+            out[global_r * head_dim + d] = 0.0f;
+        }
+    }
+}
 
 # Step 24 - flash_attention_launcher (not yet solved)
 # TODO: implement
