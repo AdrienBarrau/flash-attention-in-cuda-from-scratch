@@ -280,10 +280,9 @@ __device__ float correction_factor(float old_max, float new_max) {
 
 # Step 15 - update_running_sum
 __device__ float update_running_sum(float old_sum, float correction, float block_sum) {
-    // 1. Rescale the previous state so it is relative to the new max.
+
     float rescaled_sum = old_sum * correction;
-    
-    // 2. Accumulate the new data into the running sum.
+ 
     return rescaled_sum + block_sum;
 }
 
